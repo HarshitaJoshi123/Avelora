@@ -360,7 +360,7 @@ def _get_city_center_coordinates(city: str) -> tuple[float, float]:
                     "addressdetails": 1,
                     "limit": 1,
                 },
-                headers={"User-Agent": "TripMateAI/2.0 airport lookup"},
+                headers={"User-Agent": "Avelora/2.0 airport lookup"},
                 timeout=10,
             )
             _LAST_CITY_GEOCODING_REQUEST = time.monotonic()
@@ -974,7 +974,7 @@ User request:
         return {
             "guardrail_allowed": False,
             "guardrail_reason": (
-                "TripMate AI could not validate your request "
+                "Avelora could not validate your request "
                 "right now. Please try again."
             ),
             "selected_agents": [],
@@ -999,7 +999,7 @@ User request:
     if not allowed:
 
         reason = guardrail_reason or (
-            "TripMate AI can only help with travel-related requests."
+            "Avelora can only help with travel-related requests."
         )
 
         return {
