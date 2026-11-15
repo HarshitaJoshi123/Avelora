@@ -6920,19 +6920,17 @@ RULES:
 - Do not rerun or fabricate flight, hotel, weather, or budget research.
 - Do not invent hotel prices, booking URLs, flight schedules, weather, ratings or availability.
 - Preserve all budget numbers exactly as shown in the existing draft.
-- Return the complete revised plan with these seven headings:
+- Return ONLY these three sections, each heading on its own line with nothing after it:
   1. Trip Summary
-  2. Flight Information
-  3. Hotel Suggestions
-  4. Weather Information
   5. Day-by-Day Itinerary
-  6. Estimated Budget
   7. Final Recommendations
+- Do NOT write flight, hotel, weather or budget sections. They are rebuilt
+  automatically from verified data.
 - Keep the full day-by-day itinerary.
 - In section 5, use a Markdown table with columns Day, Morning,
   Afternoon, and Evening / Night.
 - Give every requested day its own row and preserve the 3-part daily structure.
-- Do not add explanations outside the seven sections.
+- Do not add explanations outside these three sections.
 """
 
     expected_days = expected_itinerary_day_count(constraints_data)
@@ -7029,13 +7027,9 @@ The previous itinerary validation failed for this specific reason:
 {validation_error}
 
 Correct that structural problem while preserving the user's requested revision.
-Return all seven sections with these exact headings:
+Return ONLY these three sections, each heading on its own line with nothing after it:
 1. Trip Summary
-2. Flight Information
-3. Hotel Suggestions
-4. Weather Information
 5. Day-by-Day Itinerary
-6. Estimated Budget
 7. Final Recommendations
 
 In section 5, use this four-column Markdown table:
@@ -7044,8 +7038,7 @@ In section 5, use this four-column Markdown table:
 Include each required day exactly once, in order, from Day 1 through the
 expected final day. Every row must have exactly four cells, with non-empty
 morning, afternoon, and evening/night activities. Preserve the user's requested
-changes; do not revert them merely to satisfy the structure. Do not add text
-outside the seven sections.
+changes; do not revert them merely to satisfy the structure. Do not add text outside these three sections.
 
 PREVIOUS RESPONSE THAT FAILED VALIDATION:
 {revised}
