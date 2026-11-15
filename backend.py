@@ -1,34 +1,56 @@
-import os
-import certifi
-from dotenv import load_dotenv
-from datetime import date, datetime, timedelta, timezone
-from functools import lru_cache
-import re
-from pydantic import BaseModel, Field, ConfigDict, ValidationError
-import pycountry
-from timezonefinder import TimezoneFinder
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+"""
+Avelora backend: multi-agent travel planner (LangGraph).
 
-load_dotenv()
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+FLOW
+    supervisor -> flight -> hotel -> weather -> itinerary -> budget
+               -> human_approval -> final_agent            (approved)
+                                 -> revision_agent -> (re-run affected agents)
+                                                   -> revision_finalize
 
-from typing import Any, TypedDict, Annotated
-import operator
-import uuid
+FILE LAYOUT
+    1. Setup: env, LLM, shared state
+    2. Helpers: airports, dates, route, traveller count
+    3. Supervisor + guardrail
+    4. Specialist agents: 4.1 flight, 4.2 hotel, 4.3 weather, 4.4 budget
+    5. Itinerary agent (+ day-table validation)
+    6. Human approval + revision + final
+    7. Renderers: build the final 7-section response
+    8. Graph wiring + PostgreSQL checkpointer
+    9. FastAPI-facing helpers
+"""
+
+# --- Standard library ---
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import json
 import math
+import operator
+import os
+import re
+import re
 import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
+from typing import Any, TypedDict, Annotated
 from urllib.parse import urlparse
-import requests
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+# --- Third-party ---
+import airportsdata
+import certifi
 import psycopg
+import pycountry
+import requests
+from dotenv import load_dotenv
 from psycopg.rows import dict_row
-from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.postgres import PostgresSaver
-from langgraph.types import Command, interrupt
+from pydantic import BaseModel, Field, ConfigDict, ValidationError
+from timezonefinder import TimezoneFinder
+
+
+# --- LangGraph / LangChain ---
 from langchain_core.messages import (
     AnyMessage,
     HumanMessage,
@@ -36,8 +58,19 @@ from langchain_core.messages import (
     SystemMessage,
 )
 from langchain_groq import ChatGroq
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command, interrupt
 
 
+# --- Environment setup (must run BEFORE importing mcp_client) ---
+load_dotenv()  # mcp_client may read API keys at import time
+# Use certifi's CA bundle so HTTPS calls to external APIs don't fail on certificate errors.
+os.environ["SSL_CERT_FILE"] = certifi.where()
+os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+
+
+# --- Local modules ---
 from mcp_client import (
     tavily_mcp_search,
     aviation_mcp_call,
@@ -47,7 +80,12 @@ from mcp_client import (
 )
 
 
+# ============================================================
+# 1. SETUP: environment, LLM, shared state
+# ============================================================
+
 def get_database_url():
+    """Read DATABASE_URL from .env and enforce sslmode=require (needed by hosted Postgres)."""
     database_url = os.getenv("DATABASE_URL")
 
     if not database_url:
@@ -68,22 +106,22 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY is missing. Please add it to your .env file.")
 
-# =========================
-# LLM - original model kept
-# =========================
+# ===== LLM =====
+# Groq-hosted gpt-oss-120b. Reasoning tokens count toward max_tokens, so we use
+# low reasoning effort and hide the reasoning; otherwise the visible
+# itinerary can get cut off.
 llm = ChatGroq(
     model="openai/gpt-oss-120b",
     api_key=GROQ_API_KEY,
-    # The previous 3,000-token cap was exhausted almost entirely by
-    # GPT-OSS reasoning tokens, leaving no visible itinerary content.
-    # GPT-OSS 120B supports up to 65,536 output tokens on Groq.
     max_tokens=6000,
     temperature=0.3,
     reasoning_effort="low",
     reasoning_format="hidden",
 )
 
+
 def log_llm_usage(stage, response):
+    """Print finish reason and token usage; warn when the model stopped because of the token limit."""
     metadata = response.response_metadata or {}
 
     print(f"\n========== {stage} ==========")
@@ -97,38 +135,39 @@ def log_llm_usage(stage, response):
     print("=============================\n")
     
 
-
 def run_async(coro):
-    """Run an async MCP coroutine from either sync or already-async callers."""
+    """
+    Run an async MCP call from a synchronous LangGraph node.
+    If an event loop is already running (FastAPI), run the coroutine in a
+    separate thread with its own loop to avoid "loop already running" errors.
+    """
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
 
-    # A synchronous agent can also be invoked from an async web handler.
-    # Run the coroutine in a dedicated thread with its own event loop.
     with ThreadPoolExecutor(max_workers=1) as executor:
         return executor.submit(asyncio.run, coro).result()
 
 
-
-# =========================
-# State - original fields kept, new control fields added
-# =========================
-
+# ===== Shared state =====
 # Think of TravelState as a shared notebook. Every agent reads from it and writes its own results into it.
 class TravelState(TypedDict, total=False):
-    messages: Annotated[list[AnyMessage], operator.add]
+    """
+    Single state object shared by every graph node. Each agent reads the
+    keys it needs and writes only its own output keys.
+    """
+    messages: Annotated[list[AnyMessage], operator.add] # operator.add: messages are appended, not overwritten
     user_query: str
 
-    # Supervisor + guardrail state
+    # --- Guardrail + supervisor output ---
     guardrail_allowed: bool
     guardrail_reason: str
     selected_agents: list[str]
     trip_constraints: dict[str, Any]
     supervisor_reasoning: str
 
-    # Specialist results
+    # --- Specialist agent outputs (text for the LLM + structured data for rendering) ---
     flight_results: str
     flight_data: list[dict[str, Any]]
     flight_results_available: bool
@@ -139,25 +178,26 @@ class TravelState(TypedDict, total=False):
 
     weather_results: str
     weather_data: dict[str, Any]
-    itinerary: str
+    itinerary: str  # full 7-section markdown draft
 
-    # New budget + HITL state
+    # --- Budget + human-in-the-loop ---
     budget_results: str
-    approval_request: str
+    approval_request: str  # message shown to the user at the approval step
     approved: bool
     human_feedback: str
     final_response: str
+    
+    # --- Revision control (set by revision_agent, read by specialist agents) ---
     revision_count: int
-    revision_agents: list[str]
-    revision_flight_preference: str
+    revision_agents: list[str]  # agents that must re-run after user feedback
+    revision_flight_preference: str  # morning / afternoon / evening / night
     revision_flight_airline: str
 
-    llm_calls: int
+    llm_calls: int  # running count of LLM calls, returned to the UI
 
 
-# =========================
-# Shared helpers
-# =========================
+# ===== Shared Helpers =====
+# Agents the supervisor may select. Any other name returned by the LLM is dropped.
 KNOWN_AGENTS = {
     "flight_agent",
     "hotel_agent",
@@ -178,6 +218,7 @@ AGENT_ORDER = [
 
 
 def _llm_text(system_prompt: str, user_prompt: str) -> str:
+    """One LLM call (system + user message); returns the reply as plain text."""
     response = llm.invoke(
         [
             SystemMessage(content=system_prompt),
@@ -188,7 +229,7 @@ def _llm_text(system_prompt: str, user_prompt: str) -> str:
 
 
 def _json_from_llm(text: str) -> dict[str, Any]:
-    """Extract the first complete JSON object returned by the model."""
+    """Extract the first complete JSON object returned by the model. Raises ValueError if none is found."""
     start = text.find("{")
     end = text.rfind("}")
 
@@ -197,25 +238,26 @@ def _json_from_llm(text: str) -> dict[str, Any]:
 
     return json.loads(text[start : end + 1])
 
-# =========================
-# Airport IATA Code Mapping
-# =========================
 
 
-# =========================
-# Airport Database Integration
-# =========================
 
-import airportsdata
+# ============================================================
+# 2. HELPERS: airports, dates, route, traveller count
+# Deterministic (regex/database) code that backs up the LLM.
+# ============================================================
 
-# Load the local IATA airport database once
-AIRPORT_DATABASE = airportsdata.load("IATA")
+# ===== Airport Database Integration =====
+AIRPORT_DATABASE = airportsdata.load("IATA")  # Load the local IATA airport database once
+
+# Nominatim's usage policy allows ~1 request/second, so geocoding is cached,
+# lock-protected and throttled.
 _CITY_COORDINATE_CACHE: dict[str, tuple[float, float]] = {}
 _CITY_GEOCODING_LOCK = threading.Lock()
 _LAST_CITY_GEOCODING_REQUEST = 0.0
 
 
-# City name aliases
+# ===== City name aliases =====
+# Common city names and alternate spellings mapped straight to an IATA code.
 AIRPORT_ALIASES = {
     "delhi": "DEL",
     "new delhi": "DEL",
@@ -250,7 +292,14 @@ AIRPORT_ALIASES = {
 
 
 def get_airport_code(city: str) -> str | None:
-
+    """
+    Resolve a city name to an IATA code, in this order:
+      1. Known alias ("bangalore" -> BLR)
+      2. IATA code typed directly by the user
+      3. Exact city-name match in airportsdata (INDIA ONLY)
+    If a city has several airports, the one nearest the geocoded city centre
+    is used. Returns None when nothing matches.
+    """
     if not city:
         return None
 
@@ -311,6 +360,7 @@ def get_airport_code(city: str) -> str | None:
 
             latitude_delta = math.radians(airport_latitude - city_latitude)
             longitude_delta = math.radians(airport_longitude - city_longitude)
+            # Haversine: great-circle distance (km) between the city centre and each airport.
             haversine = (
                 math.sin(latitude_delta / 2) ** 2
                 + math.cos(math.radians(city_latitude))
@@ -334,7 +384,10 @@ def get_airport_code(city: str) -> str | None:
 
 
 def _get_city_center_coordinates(city: str) -> tuple[float, float]:
-    """Geocode an Indian city to coordinates used for nearest-airport selection."""
+    """
+    Geocode an Indian city to coordinates used for nearest-airport selection.
+    Geocode an Indian city with OpenStreetMap Nominatim (cached and rate-limited).
+    """
     global _LAST_CITY_GEOCODING_REQUEST
 
     cache_key = city.strip().lower()
@@ -408,6 +461,7 @@ def _get_city_center_coordinates(city: str) -> tuple[float, float]:
 
 
 def _empty_constraints() -> dict[str, Any]:
+    """Blank trip-constraints dict; also the definitive list of constraint fields."""
     return {
         "destination": "",
         "origin": "",
@@ -447,6 +501,7 @@ _TRAVELLER_COUNT_WORDS = {
 
 
 def normalize_traveller_count(value: Any) -> int | None:
+    """Turn 2 / "2" / "two" into an int. Returns None for invalid or non-positive values."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -463,6 +518,10 @@ def normalize_traveller_count(value: Any) -> int | None:
 
 
 def extract_traveller_count(query: str) -> int | None:
+    """
+    Find a party size in free text. Returns None when ambiguous
+    (e.g. "2 adults and 1 child" without a stated total).
+    """
     number = r"(?:\d+|" + "|".join(_TRAVELLER_COUNT_WORDS) + r")"
     individual_pattern = re.compile(
         rf"\b({number})\s*(travellers?|travelers?|people|persons?|adults?|"
@@ -494,6 +553,11 @@ def resolve_traveller_count(
     constraints: dict[str, Any],
     query: str,
 ) -> tuple[int, bool]:
+    """
+    Return (count, assumed).
+    Priority: structured value from constraints > regex match in the query >
+    default of 1 (assumed=True, so callers can warn that party size was guessed).
+    """
     structured_count = normalize_traveller_count(constraints.get("traveller_count"))
     if structured_count is not None:
         return structured_count, False
@@ -506,10 +570,7 @@ def resolve_traveller_count(
 
 
 
-# =========================
-# Deterministic trip-date extraction
-# =========================
-
+# ===== Deterministic trip-date extraction =====
 _MONTHS = {
     name.lower(): index
     for index, name in enumerate(
@@ -633,7 +694,10 @@ def extract_trip_dates(query: str) -> tuple[str, str]:
 
 
 def extract_route_from_query(query: str) -> tuple[str, str]:
-    """Extract a route only when the request describes one unambiguous leg."""
+    """
+    Extract (origin, destination) from "from X to Y". Returns blanks when the
+    request has several legs (and/via/then), since one route can't be assumed.
+    """
     text = str(query or "")
     route_pattern = re.compile(
         r"\bfrom\s+([A-Za-z][A-Za-z .'-]*?)\s+to\s+"
@@ -659,7 +723,10 @@ def extract_route_from_query(query: str) -> tuple[str, str]:
 
 
 def deterministic_trip_constraints(query: str) -> dict[str, Any]:
-    """Recover high-confidence trip details if supervisor extraction is incomplete."""
+    """
+    Recover high-confidence trip details if supervisor extraction is incomplete.
+    Build a constraints dict from regex only. Used as LLM fallback and to cross-check the LLM.
+    """
     constraints = _empty_constraints()
     origin, destination = extract_route_from_query(query)
     outbound, inbound = extract_trip_dates(query)
@@ -721,7 +788,20 @@ def merge_deterministic_constraints(
     extracted: dict[str, Any],
     query: str,
 ) -> dict[str, Any]:
-    """Use only unambiguous deterministic matches to supplement LLM extraction."""
+    """
+    Combine the LLM's extracted trip details with regex-extracted ones.
+
+    Trip details come from two sources:
+      1. LLM - smart and flexible, but it sometimes makes mistakes.
+      2. Regex - reads the text directly, but only catches clear, unambiguous
+         values (e.g. one route, one date range).
+
+    Merge LLM-extracted trip details with regex-extracted ones.
+
+    The LLM is smart but can make mistakes; regex is precise but only catches
+    clear values. A clear regex match overrides the LLM value for route, dates,
+    duration, style and traveller count. Otherwise the LLM value is kept.
+    """
     merged = _empty_constraints()
     if isinstance(extracted, dict):
         merged.update({k: v for k, v in extracted.items() if k in merged})
@@ -754,10 +834,17 @@ def merge_deterministic_constraints(
     return merged
 
 
-# =========================
-# Supervisor Output Schemas
-# =========================
+# ============================================================
+# 3. SUPERVISOR + INPUT GUARDRAIL
+# Reads:  user_query, llm_calls
+# Writes: guardrail_allowed, guardrail_reason, selected_agents,
+#         trip_constraints, supervisor_reasoning, final_response (if blocked)
+# ============================================================
 
+
+# These models check that the JSON returned by the LLM has the expected shape.
+# extra="forbid": an unexpected key causes an error.
+# extra="ignore": an unexpected key is silently dropped.
 class TripConstraints(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -797,16 +884,17 @@ class RevisionResearchPlan(BaseModel):
     flight_airline_preference: str = ""
     
     
-# =========================
-# Deterministic Supervisor Fallback
-# =========================
-
+# ===== Deterministic Supervisor Fallback =====
 def fallback_agent_selection(query: str) -> list[str]:
+    """Keyword-based agent choice when the supervisor LLM fails. itinerary_agent is always included."""
 
     query = query.lower()
 
     selected = []
-
+    
+    # Keywords for rule-based agent selection. Used (a) when the supervisor LLM
+    # fails and (b) to force-include agents the LLM under-selected.
+     
     # Flight-related keywords
     flight_keywords = [
         "flight", "airport", "airline", "airfare",
@@ -875,6 +963,7 @@ def fallback_agent_selection(query: str) -> list[str]:
 
 
 def is_trip_planning_request(query: str) -> bool:
+    """True for phrases like 'plan a trip' / 'create an itinerary'."""
     has_planning_intent = re.search(
         r"\b(?:plan|planning|create|build|make|design|organize|generate)\b",
         query,
@@ -888,22 +977,22 @@ def is_trip_planning_request(query: str) -> bool:
     return bool(has_planning_intent and has_trip_context)
 
 
-# =========================
-# Supervisor Agent + Input Guardrail
-# =========================
+
 # Coordinator + LLM
-
 # Supervisor is not fetching information from travel websites. It is understanding the request and deciding what needs to be fetched.
-
 def supervisor_agent(state: TravelState):
+    """
+    Entry node:
+      1. Guardrail: block non-travel or harmful requests (fails closed if the LLM errors).
+      2. Choose which specialist agents are needed.
+      3. Extract trip constraints (LLM + regex merge).
+    It never fetches travel data itself; it only plans the work.
+    """
 
     query = state["user_query"]
     llm_calls = state.get("llm_calls", 0)
 
-    # ==================================
-    # PART 1: INPUT GUARDRAIL
-    # ==================================
-
+    # ===== Step 1 (INPUT GUARDRAIL): Input guardrail (is this a travel request?) =====
     guardrail_prompt = f"""
 You are an input guardrail for a travel-planning application.
 
@@ -992,10 +1081,8 @@ User request:
             "llm_calls": llm_calls,
         }
 
-    # ==================================
-    # PART 2: BLOCK INVALID REQUESTS
-    # ==================================
 
+    # ===== Step 2 (BLOCK INVALID REQUESTS): Stop early if the request was blocked =====
     if not allowed:
 
         reason = guardrail_reason or (
@@ -1017,10 +1104,7 @@ User request:
             "llm_calls": llm_calls,
         }
 
-    # ==================================
-    # PART 3: SUPERVISOR AGENT
-    # ==================================
-
+    # ===== Step 3 (SUPERVISOR AGENT): Supervisor LLM picks agents and extracts constraints =====
     supervisor_prompt = f"""
 You are the supervisor of a multi-agent travel-planning system.
 
@@ -1193,10 +1277,8 @@ USER REQUEST:
             supervisor_data
         )
 
-        # ==================================
-        # PART 4: VALIDATE AGENT SELECTION
-        # ==================================
 
+        # ===== Step 4 (VALIDATE AGENT SELECTION): Validate agent list (drop unknown/duplicates, restore order)=====
         requested_agents = supervisor_result.selected_agents
 
         # Remove unknown agents and duplicates
@@ -1217,10 +1299,8 @@ USER REQUEST:
             if agent in valid_agents
         ]
 
-        # ==================================
-        # PART 5: VALIDATE TRIP CONSTRAINTS
-        # ==================================
 
+        # ===== Step 5 (VALIDATE TRIP CONSTRAINTS): Validate constraints (ISO dates, return not before outbound)=====
         constraints = supervisor_result.trip_constraints.model_dump()
 
         # Deterministic extraction supplements the LLM result.
@@ -1255,10 +1335,8 @@ USER REQUEST:
             flush=True
         )
 
-        # ==================================
-        # PART 6: DETERMINISTIC FALLBACK
-        # ==================================
 
+        # ===== Step 6 (DETERMINISTIC FALLBACK): LLM output unusable -> fall back to keyword/regex extraction =====
         selected_agents = fallback_agent_selection(query)
 
         constraints = deterministic_trip_constraints(query)
@@ -1271,12 +1349,16 @@ USER REQUEST:
         )
         
     
-    
     # Always supplement supervisor extraction with deterministic parsing.
+    # Repeated on purpose: the merge inside the try block is skipped when the
+    # fallback path runs, and this line also covers that case.
     constraints = merge_deterministic_constraints(constraints, query)
-
+    
+    
+    # Safety nets: the LLM sometimes skips agents the user explicitly asked for,
+    # so the rules below add them back (budget, hotel, weather, flight).
+    
     # ENFORCE BUDGET AGENT SELECTION
-
     budget_keywords = [
         "budget",
         "estimated cost",
@@ -1336,11 +1418,8 @@ USER REQUEST:
         if agent in selected_agents
     ]
 
-
-    # ==================================
     # APPLY DEFAULT ORIGIN FROM .ENV
-    # ==================================
-
+    # Optional deployment default (e.g. a home airport) when the user gives no origin.
     default_origin = os.getenv(
         "DEFAULT_ORIGIN_IATA", ""
     ).strip().upper()
@@ -1363,10 +1442,8 @@ USER REQUEST:
         flush=True
     )
 
-    # ==================================
-    # PART 7: RETURN UPDATED STATE
-    # ==================================
 
+    # ===== Step 7 (RETURN UPDATED STATE): Return the state update =====
     return {
         "guardrail_allowed": True,
         "guardrail_reason": guardrail_reason,
@@ -1381,10 +1458,10 @@ USER REQUEST:
         "llm_calls": llm_calls,
     }
 
-# =========================
-# Guardrail blocked response
-# =========================
+
+# ===== Guardrail blocked response =====
 def guardrail_blocked_agent(state: TravelState):
+    """Terminal node for blocked requests: returns the guardrail reason as the final response."""
     reason = state.get("final_response") or state.get("guardrail_reason") or (
         "This request was blocked by the travel input guardrail."
     )
@@ -1396,9 +1473,32 @@ def guardrail_blocked_agent(state: TravelState):
 
 
 
-def parse_aviation_response(result):
-    """Parse and validate the actual AviationStack MCP response."""
+# ============================================================
+# 4. SPECIALIST AGENTS
+# Each agent fetches one kind of data and writes its own state keys:
+#   4.1 Flight   - schedules (AviationStack) + fare estimate (Tavily)
+#   4.2 Hotel    - verified properties and prices (Tavily)
+#   4.3 Weather  - current weather + forecast (OpenWeather)
+#   4.4 Budget   - deterministic cost estimate (INR)
+# They run one after another in AGENT_ORDER, not in parallel.
+# ============================================================
 
+
+# ============================================================
+# 4.1 FLIGHT AGENT
+# Source: AviationStack MCP (schedules) + Tavily MCP (fare estimate)
+# Reads:  trip_constraints, user_query, revision_agents, human_feedback,
+#         revision_flight_preference, revision_flight_airline
+# Writes: flight_results, flight_data, flight_results_available,
+#         flight_fare, trip_constraints (return_date, if inferred)
+# ============================================================
+
+def parse_aviation_response(result):
+    """
+    Parse and validate the actual AviationStack MCP response.
+    Normalize the MCP reply (dict / JSON string / content blocks) and validate ok=True plus a list of flight dicts.
+    """
+    
     payload = None
 
     # Case 1: MCP directly returns a dictionary
@@ -1471,6 +1571,8 @@ def parse_aviation_response(result):
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
+
+# AviationStack timestamps may be UTC; schedules are compared in IST (India-focused app).
 def _scheduled_departure_date(record: dict[str, Any]) -> date | None:
     """Return the IST departure date used for schedule matching.
 
@@ -1500,16 +1602,16 @@ def _scheduled_departure_date(record: dict[str, Any]) -> date | None:
 
 
 
-# =========================
-# Flight Agent - Improved Version
-# =========================
-# External API + MCP + Python processing
 
+# External API + MCP + Python processing
 # Data provider: AviationStack
 # Integration: AviationStack MCP through aviation_mcp_call()
 
 def flight_matches_departure_period(value: Any, preference: str) -> bool:
-    """Return whether a scheduled departure falls in a requested local-time period."""
+    """
+    Return whether a scheduled departure falls in a requested local-time period.
+    True if the scheduled hour falls in the period (morning 5-12, afternoon 12-17, evening 17-22, night 22-5).
+    """
     raw_value = str(value or "").strip()
     if not raw_value:
         return False
@@ -1538,7 +1640,10 @@ def flight_matches_departure_period(value: Any, preference: str) -> bool:
 
 
 def flight_matches_airline(value: Any, preference: str) -> bool:
-    """Return whether a flight record or search result mentions the requested carrier."""
+    """
+    Return whether a flight record or search result mentions the requested carrier.
+    Case/punctuation-insensitive check that a record or search result mentions the airline.
+    """
     airline = re.sub(r"[^a-z0-9]+", " ", preference.lower()).strip()
     if not airline:
         return True
@@ -1572,9 +1677,15 @@ def _is_cargo_flight(record: dict[str, Any]) -> bool:
 
 
 def flight_agent(state: TravelState):
-    """Retrieve flight schedules and a separate search-derived fare estimate."""
+    """
+    Two independent lookups:
+      * Schedules from AviationStack. This API has no fares.
+      * An indicative fare from a Tavily web search (never a bookable quote).
+    On a revision, honours the user's departure-time and airline preference.
+    """
     print("\nINSIDE FLIGHT AGENT\n", flush=True)
-
+    
+    # Step 1: Read constraints, add the revision request, resolve party size
     constraints = state.get("trip_constraints", {}) or {}
     user_query = str(state.get("user_query", ""))
     if "flight_agent" in state.get("revision_agents", []):
@@ -1592,8 +1703,7 @@ def flight_agent(state: TravelState):
         user_query,
     )
 
-    # If only an outbound date and a duration in days were supplied,
-    # infer a planning return date as N-1 days after departure.
+    # Step 2: If only an outbound date and a duration in days were supplied, infer a planning return date as N-1 days after departure.
     inferred_return_date = False
     if not return_date and outbound_date:
         duration_text = str(constraints.get("duration", ""))
@@ -1618,7 +1728,8 @@ def flight_agent(state: TravelState):
         "sources": [],
         "message": "A route and outbound date are required for a fare search.",
     }
-
+    
+    # Step 3: Validate inputs (route and outbound date are required)
     if not origin or not destination:
         flight_results = (
             "Flight search requires both departure and destination cities. "
@@ -1631,6 +1742,7 @@ def flight_agent(state: TravelState):
         )
     else:
         try:
+            #Step 4: Fare estimate from web search (failure here must not block schedules)
             flight_fare = run_async(search_flight_fare_estimate(
                 origin,
                 destination,
@@ -1654,6 +1766,7 @@ def flight_agent(state: TravelState):
             }
 
         try:
+            # Step 5: Resolve both cities to IATA codes
             origin_code = get_airport_code(origin)
             destination_code = get_airport_code(destination)
 
@@ -1677,9 +1790,11 @@ def flight_agent(state: TravelState):
                     "to_code": origin_code,
                     "travel_date": return_date,
                 })
-
+                
+            # Step 6: Fetch the schedule for each leg (outbound, then return)
             async def fetch_schedule_for_leg(leg: dict[str, str]):
                 requested = date.fromisoformat(leg["travel_date"])
+                # Past dates need a paid AviationStack plan; today uses the live endpoint, future dates use the future-schedule endpoint.
                 if requested < date.today():
                     return leg, None, (
                         "Historical flight searches require a paid "
@@ -1737,6 +1852,8 @@ def flight_agent(state: TravelState):
                     # Wait 60s ONCE between legs. If return still fails,
                     # render_flight_section will show a Google Flights fallback link.
                     if idx < len(legs) - 1:
+                        # Free tier allows roughly one request per minute, so wait between the
+                        # outbound and return legs instead of retrying after a rate-limit error.
                         await asyncio.sleep(60)
                 return outcomes
 
@@ -1762,6 +1879,7 @@ def flight_agent(state: TravelState):
                     continue
 
                 records = payload.get("data", []) if payload else []
+                # Step 7: Filter. Cargo-only carriers (Blue Dart, FedEx...) show up in schedules but can't be booked by passengers.
                 records = [r for r in records if not _is_cargo_flight(r)] 
                 matches = []
                 mismatched_date_count = 0
@@ -1774,12 +1892,15 @@ def flight_agent(state: TravelState):
                     departure_code = str(
                         record.get("departure_airport_code") or leg["from_code"]
                     ).strip().upper()
+                    # Compare dates in IST. A UTC timestamp for a 01:55 IST flight falls on the
+                    # previous day and would be wrongly rejected as "a different date".
                     scheduled_date = _scheduled_departure_date(record)
 
                     if (
                         arrival_code == leg["to_code"]
                         and departure_code == leg["from_code"]
                     ):
+                        # The date can't be proven, so exclude the record rather than guess.
                         if scheduled_date is None:
                             unverifiable_date_count += 1
                             continue
@@ -1810,9 +1931,8 @@ def flight_agent(state: TravelState):
                         )
                     ]
 
-                # Collapse duplicate marketing/codeshare rows that share the
-                # same route, date and scheduled departure/arrival. The API's
-                # multiple airline labels must not be shown as separate flights.
+                # Step 8: Collapse codeshares. The API lists one physical flight once per
+                # marketing airline; show it as a single row with "also marketed as" codes.
                 grouped_schedules: dict[tuple, dict[str, Any]] = {}
                 for record in matches:
                     departure_time = record.get("departure_scheduled_time")
@@ -1956,7 +2076,8 @@ def flight_agent(state: TravelState):
                 "schedules and booking availability have not been verified. "
                 f"Technical detail: {type(exc).__name__}: {exc}"
             )
-
+    
+    # Step 9: Append the fare note to the schedule text
     fare_summary = format_flight_fare_summary(flight_fare)
     if fare_summary:
         flight_results = f"{flight_results}\n\n{fare_summary}".strip()
@@ -1981,6 +2102,7 @@ def flight_agent(state: TravelState):
 
 
 def format_flight_fare_summary(flight_fare: dict[str, Any]) -> str:
+    """Human-readable fare note; says 'unavailable' clearly when no usable fare was found."""
     if not isinstance(flight_fare, dict):
         return ""
 
@@ -2044,25 +2166,11 @@ def format_flight_fare_summary(flight_fare: dict[str, Any]) -> str:
 
 
 
-# =========================
-# Tavily Response Parser
-# =========================
-
+# ===== Tavily Response Parser =====
 def parse_tavily_response(
     response: Any,
 ) -> list[dict[str, Any]]:
-    """
-    Parse the actual Tavily MCP response.
-
-    Expected MCP format:
-    [
-        {
-            "id": "...",
-            "text": "{JSON response}",
-            "type": "text"
-        }
-    ]
-    """
+    """Normalize Tavily MCP output (content blocks / JSON string / dict) to a list of {title, url, content, score}."""
 
     parsed_results = []
 
@@ -2139,7 +2247,11 @@ def extract_flight_fare_estimate(
     outbound_date: str = "",
     return_date: str = "",
 ) -> dict[str, Any]:
-    """Extract route-, date-, and traveller-matched fare indications."""
+    """
+    Pull per-passenger fares out of search results. A result counts only if it
+    names the route, matches the dates and states an explicit per-person fare.
+    Amounts are converted to INR and must fall within 500-2,000,000.
+    """
     currency_markers = (
         ("INR", r"(?:₹|\bINR\b|\bRs\.?)"),
         ("EUR", r"(?:€|\bEUR\b)"),
@@ -2321,7 +2433,7 @@ async def search_flight_fare_estimate(
     traveller_count: int | None = None,
     airline_preference: str = "",
 ) -> dict[str, Any]:
-    """Search Tavily for a date- and party-specific indicative flight fare."""
+    """Build the fare query, run Tavily and return an indicative-fare dict (status: indicative / unavailable / conversion_unavailable)."""
     traveller_count, traveller_count_assumed = resolve_traveller_count(
         {"traveller_count": traveller_count},
         user_query,
@@ -2425,14 +2537,17 @@ async def search_flight_fare_estimate(
 
 
 
-# =========================
-# Hotel Price Helper Functions
-# =========================
-
-import re
-
+# ============================================================
+# 4.2 HOTEL AGENT
+# Source: Tavily MCP search, then strict Python verification
+# Reads:  trip_constraints, revision_agents, human_feedback
+# Writes: hotel_results, hotel_data
+# Rule:   a hotel is shown only after passing name, location, URL and price
+#         checks. Blogs, listicles and city pages are rejected.
+# ============================================================
 
 def normalize_hotel_name(name: str) -> str:
+    """Lowercase, strip punctuation and collapse spaces, so names compare reliably."""
     name = str(name or "").lower()
     name = re.sub(r"[^a-z0-9\s]", " ", name)
     return " ".join(name.split())
@@ -2444,8 +2559,7 @@ def classify_hotel_display_category(
     search_category: str = "",
     details: str = "",
 ) -> str:
-    """Correct obvious luxury-property misclassification without inventing star ratings."""
-    name = normalize_hotel_name(hotel_name)
+    """Label Luxury/Heritage only from explicit evidence in the text; never invent star ratings."""
     evidence = normalize_hotel_name(details)
     # Destination-independent classification: use explicit property evidence,
     # never a hard-coded list of hotels or cities.
@@ -2465,11 +2579,12 @@ def classify_hotel_display_category(
     return category if category else "Category not verified"
 
 
+
 def validate_hotel_price_for_display(
     price: Any,
     currency: str | None,
 ) -> tuple[float | None, float | None, str | None, str]:
-    """Convert a plausible nightly indication to INR using a current reference rate."""
+    """Convert to INR and reject amounts outside 1,200-200,000 per night (likely a snippet mismatch)."""
     if price is None:
         return None, None, None, "unavailable"
     try:
@@ -2500,8 +2615,12 @@ _FX_RATE_CACHE_TTL_SECONDS = 6 * 60 * 60
 _FX_RATE_LOCK = threading.Lock()
 
 
+
 def get_latest_inr_exchange_rate(currency: str) -> tuple[float, str]:
-    """Fetch and briefly cache a reference conversion rate from currency to INR."""
+    """
+    Fetch and briefly cache a reference conversion rate from currency to INR.
+    Frankfurter FX rate to INR, cached for 6 hours (thread-safe).
+    """
     normalized_currency = str(currency or "").upper().strip()
     if not re.fullmatch(r"[A-Z]{3}", normalized_currency):
         raise ValueError(f"Unsupported currency code: {currency!r}")
@@ -2549,11 +2668,15 @@ def get_latest_inr_exchange_rate(currency: str) -> tuple[float, str]:
         return rate, rate_date
 
 
+
 def hotel_budget_match_status(
     price_inr: Any,
     hotel_budget: str,
 ) -> str:
-    """Compare the INR hotel price with the user's budget converted to INR."""
+    """
+    Compare the INR hotel price with the user's budget converted to INR.
+    within_budget / outside_budget / not_verified / conversion_unavailable / not_checked.
+    """
     if not hotel_budget:
         return "not_checked"
     if price_inr is None:
@@ -2584,6 +2707,7 @@ def hotel_budget_match_status(
         if min_budget_inr <= float(price_inr) <= max_budget_inr
         else "outside_budget"
     )
+
 
 
 def extract_price_range(text: str):
@@ -2659,6 +2783,7 @@ def extract_price_range(text: str):
     return None, None
 
 
+
 def extract_currency(text: str):
     """Return currency only when explicitly mentioned."""
 
@@ -2702,11 +2827,9 @@ def extract_currency(text: str):
     return None
 
 
+
 def extract_hotel_prices(text: str):
-    """
-    Extract nightly, total-stay and explicitly priced but unqualified amounts.
-    Prices without explicit currency are not accepted.
-    """
+    """Classify amounts as nightly, stay-total or unlabelled. Amounts with no explicit currency are ignored."""
 
     result = {
         "price_per_night": None,
@@ -2822,8 +2945,9 @@ def extract_hotel_prices(text: str):
     return result
 
 
+
 def hotel_name_matches(hotel_name: str, search_result: dict) -> bool:
-    """Match a price/property result only when its title names this property."""
+    """True only if the full property name appears in the result TITLE. Snippets and URLs are not fuzzy-matched."""
     expected = normalize_hotel_name(hotel_name)
     title = normalize_hotel_name(search_result.get("title", ""))
     if not expected or not title:
@@ -2833,12 +2957,13 @@ def hotel_name_matches(hotel_name: str, search_result: dict) -> bool:
     return expected == title or f" {expected} " in f" {title} "
 
 
+
 def hotel_location_evidence_matches(
     hotel_name: str,
     destination: str,
     search_result: dict[str, Any],
 ) -> bool:
-    """Require one source to tie the exact property name to the requested place."""
+    """One source must tie the exact property name to the destination and show address/check-in style evidence."""
     expected_name = normalize_hotel_name(hotel_name)
     destination_tokens = [
         token for token in normalize_hotel_name(destination).split()
@@ -2933,6 +3058,7 @@ def classify_hotel_url(url: str, hotel_name: str = "") -> str:
     return "unverified"
 
 
+
 def is_real_hotel_candidate(
     result: dict[str, Any],
     destination: str = "",
@@ -2954,7 +3080,8 @@ def is_real_hotel_candidate(
     parsed = urlparse(url)
     host = (parsed.netloc or "").lower().split(":")[0]
     path = (parsed.path or "").lower()
-
+    
+    # 1. Domains that are never a single hotel page: video, forums, review sites, travel blogs, encyclopedias, Airbnb category pages.
     blocked_domains = (
         "youtube.com", "youtu.be", "tripadvisor.", "facebook.com",
         "reddit.com", "pinterest.", "instagram.com", "tiktok.",
@@ -2972,6 +3099,8 @@ def is_real_hotel_candidate(
     # properties). E.g. https://www.ihg.com/mumbai-india is IHG's Mumbai city
     # page, not a real hotel listing. Legitimate brand-domain property pages
     # always contain a specific property slug (e.g. /hoteldetail, /hotels/us/en/...).
+    
+    # 2. Brand sites (Marriott, IHG...) also publish city and country hub pages. Accept a brand URL only if its path looks like one specific property.
     brand_domains = (
         "marriott.com", "ihg.com", "hyatt.com", "hilton.com",
         "tajhotels.com", "oberoihotels.com", "radissonhotels.com",
@@ -2985,7 +3114,8 @@ def is_real_hotel_candidate(
         )
         if not any(marker in path for marker in property_path_markers):
             return False
-
+        
+    # 3. Titles such as "Best hotels in X" or "Top 10 ..." are listicles, not properties.
     generic_title_patterns = (
         r"\bbest\s+(?:(?:budget|luxury|heritage|mid[ -]?range)\s+)?hotels?\b",
         r"\btop\s+\d+\s+(?:hotels?|places?\s+to\s+stay)\b",
@@ -3011,7 +3141,8 @@ def is_real_hotel_candidate(
     )
     if any(re.search(pattern, title, re.IGNORECASE) for pattern in generic_title_patterns):
         return False
-
+    
+    # 4. The same check on the URL path (search pages, /blog/, /category/, ...).
     generic_path_patterns = (
         r"/hotels?(?:-in-[^/]+)?/?$",
         r"/hotels?/(?:search|list|city|destination)",
@@ -3023,7 +3154,7 @@ def is_real_hotel_candidate(
     if any(re.search(pattern, path) for pattern in generic_path_patterns):
         return False
 
-    # OTA results are accepted only when the URL looks like a property detail page.
+    # 5. OTA sites: accept only property-detail URLs, never city or search pages.
     if any(domain in host for domain in (
         "expedia.", "orbitz.", "kayak.", "booking.com", "agoda.",
         "makemytrip.", "goibibo.", "hotels.com", "trivago.",
@@ -3033,7 +3164,8 @@ def is_real_hotel_candidate(
             return False
         if re.search(r"/(?:city|destination|search)(?:/|$)", path):
             return False
-
+        
+    # 6. Every destination word must appear somewhere in title/content/URL, so a hotel from another city is rejected.
     destination_text = re.sub(r"[^a-z0-9 ]+", " ", str(destination or "").lower())
     destination_tokens = [token for token in destination_text.split() if len(token) > 2]
     evidence_text = re.sub(
@@ -3046,7 +3178,8 @@ def is_real_hotel_candidate(
     ):
         return False
 
-    # A property name may be a hotel, palace, haveli, resort, villa, etc.
+
+    # 7. Names don't always contain "hotel" (haveli, palace, villa...). Accept a property-type word in the title OR page-body evidence (address, check-in time...).
     property_terms = (
         r"\b(hotel|haveli|palace|resort|inn|guesthouse|guest house|"
         r"homestay|heritage|suites?|villa|residency|retreat|bungalow)\b"
@@ -3074,7 +3207,8 @@ def is_real_hotel_candidate(
         title, re.IGNORECASE
     ):
         return False
-
+    
+    # 8. Final gate: body evidence, or an unmistakable property-detail URL.
     property_detail_url = bool(re.search(
         r"/(?:hotel|property|stay|accommodation|resort|palace|haveli)[-/][^/]+",
         path
@@ -3097,7 +3231,10 @@ def hotel_category_queries(
     preferences: list[str],
     hotel_budget: str,
 ) -> list[tuple[str, str]]:
-    """Choose a small set of searches that reflect the user's requested stay style."""
+    """
+    Choose a small set of searches that reflect the user's requested stay style.
+    Choose 1-2 search queries from the user's budget or travel style (budget-specific / luxury / budget / mid-range).
+    """
     if hotel_budget:
         currency = extract_currency(hotel_budget) or "INR"
         return [(
@@ -3149,6 +3286,7 @@ def hotel_category_queries(
         )
         queries.append((label, query))
     return queries
+
 
 
 def discover_hotel_names_from_search_results(
@@ -3245,6 +3383,7 @@ Search-result evidence:
             flush=True,
         )
         return []
+
 
 
 def verify_discovered_hotel_names(
@@ -3359,6 +3498,7 @@ def verify_discovered_hotel_names(
     return verified
 
 
+
 def build_query(category: str, destination: str,
                 travel_date: str, duration: str,
                 travel_style: str, preferences: list) -> str:
@@ -3394,26 +3534,24 @@ def build_query(category: str, destination: str,
 
 
 
-# =========================
-# Hotel Agent - Multi-Search Version
-# =========================
+
+# ===== Hotel Agent - Multi-Search Version =====
+
 # Web search + MCP + Python verification
-
 # Function: hotel_agent(state)
-
 # Data provider: Tavily
 # Integration: tavily_mcp_search()
 
-# This is one of the more sophisticated agents in your project because it does more than simply search for hotels.
+# This is one of the more sophisticated agents because it does more than simply search for hotels.
 
 # Its workflow is:
 # 1. Generate search queries.
-# 2. Fetch search results.
+# 2. Fetch search results (Search via Tavily).
 # 3. Identify real hotel properties.
 # 4. Verify property-level results.
-# 5. Shortlist properties.
+# 5. Shortlist properties (max 5).
 # 6. Search for individual hotel prices.
-# 7. Validate prices and links.
+# 7. Validate prices and links and convert to INR.
 # 8. Store structured hotel records.
 
 def hotel_agent(state: TravelState):
@@ -3439,6 +3577,7 @@ def hotel_agent(state: TravelState):
     if not destination:
         hotel_results = "Hotel search requires a destination city."
     else:
+        # Step 1: Build 1-2 search queries from the user's hotel budget or travel style.
         search_queries = hotel_category_queries(
             destination=destination,
             travel_date=travel_date,
@@ -3448,6 +3587,7 @@ def hotel_agent(state: TravelState):
             preferences=preferences,
             hotel_budget=hotel_budget,
         )
+        # On a revision, add the user's feedback to every query so the new search follows it.
         if "hotel_agent" in state.get("revision_agents", []):
             feedback = str(state.get("human_feedback", "")).strip()
             if feedback:
@@ -3458,7 +3598,9 @@ def hotel_agent(state: TravelState):
                     )
                     for category, query in search_queries
                 ]
-
+                
+        # Step 2: Search Tavily once per category. A failed search is counted but
+        # does not stop the others, so partial results can still be used.
         async def run_category_searches():
             all_results = []
             successful_searches = 0
@@ -3493,6 +3635,10 @@ def hotel_agent(state: TravelState):
                     "url": str(raw_item.get("url", ""))[:250],
                     "content": str(raw_item.get("content", ""))[:350],
                 }, flush=True)
+            
+            # Step 3: Keep only real property pages. Every result must pass
+            # is_real_hotel_candidate() and have a verified URL type. Blogs, listicles
+            # and city pages are rejected, and duplicates are removed by normalized title.
             unique_hotels: dict[str, dict[str, Any]] = {}
             rejected = 0
 
@@ -3524,11 +3670,9 @@ def hotel_agent(state: TravelState):
                 flush=True,
             )
 
-            # Search engines often return a generic directory/article even
-            # when its snippet contains real property names. Extract only
-            # names explicitly present in those snippets, then verify each
-            # name through a separate property-level search. The generic
-            # directory/article itself is never shown as a hotel.
+            # Step 4: Search engines often return a directory page whose snippet names
+            # real hotels. Pull those names out, then verify each one separately. The
+            # directory page itself is never shown as a hotel.
             if len(candidates) < 5 and raw_candidates:
                 discovered_names = discover_hotel_names_from_search_results(
                     raw_candidates, destination
@@ -3554,8 +3698,7 @@ def hotel_agent(state: TravelState):
                     flush=True,
                 )
 
-            # Keep a balanced shortlist, then fill remaining slots from other
-            # verified properties if one category has too few candidates.
+            # Step 5: Balanced shortlist (up to 3 per category, max 5 overall)
             shortlisted = []
             per_category_limit = 3
             shortlisted_keys = set()
@@ -3587,7 +3730,8 @@ def hotel_agent(state: TravelState):
 
             shortlisted = shortlisted[:5]
             print("\nSHORTLISTED REAL HOTELS:", len(shortlisted), flush=True)
-
+            
+            # Steps 6-8: Price search per hotel, validate, store.
             async def search_individual_prices():
                 enriched = []
                 for hotel in shortlisted:
@@ -3941,13 +4085,19 @@ def hotel_agent(state: TravelState):
     }
 
 
+# ============================================================
+# 4.3 WEATHER AGENT
+# Source: OpenWeather via custom Weather MCP server
+# Reads:  trip_constraints
+# Writes: weather_results, weather_data
+# Rule:   a forecast is "for the trip" only if its timestamps overlap the
+#         trip dates. Current weather is never presented as a forecast.
+# ============================================================
 
-# =========================
-# Weather Response Parser
-# =========================
 
+# ===== Weather Response Parser =====
 def parse_weather_response(response: Any) -> dict[str, Any]:
-    """Parse the actual Weather MCP response."""
+    """Parse the actual Weather MCP response. Normalize the MCP reply to a dict. Raises if no valid JSON is found."""
 
     if isinstance(response, list):
         for item in response:
@@ -3969,20 +4119,6 @@ def parse_weather_response(response: Any) -> dict[str, Any]:
 
     raise ValueError("Unexpected weather response format.")
 
-
-# =========================
-# Weather Agent - Improved
-# =========================
-# External API + MCP + Python validation
-
-# Function: weather_agent(state)
-
-# Data provider: OpenWeather
-# Integration: Your custom Weather MCP server through weather_mcp_search() and forecast_mcp_search().
-
-# The Weather Agent has two separate tasks:
-# 1. Fetch the current weather for the destination.
-# 2. Fetch the available forecast and determine whether it covers the user's travel dates.
 
 
 def _forecast_datetime(value: Any) -> datetime | None:
@@ -4006,6 +4142,7 @@ def _forecast_datetime(value: Any) -> datetime | None:
     return parsed
 
 
+
 def _timezone_from_offset_seconds(value: Any) -> timezone | None:
     if (
         isinstance(value, bool)
@@ -4020,7 +4157,9 @@ def _timezone_from_offset_seconds(value: Any) -> timezone | None:
         return None
 
 
+
 def _provider_weather_location(response: Any) -> dict[str, Any] | None:
+    """Extract city, country code and coordinates from a provider reply."""
     if not isinstance(response, dict):
         return None
 
@@ -4051,6 +4190,7 @@ def _provider_weather_location(response: Any) -> dict[str, Any] | None:
     return location or None
 
 
+
 def _weather_location_label(location: dict[str, Any] | None) -> str:
     if not location:
         return "Location unavailable"
@@ -4064,6 +4204,7 @@ def _weather_location_label(location: dict[str, Any] | None) -> str:
         )
         label = f"{label} ({coordinates})" if label else coordinates
     return label or "Location unavailable"
+
 
 
 def _weather_locations_differ(
@@ -4080,8 +4221,10 @@ def _weather_locations_differ(
     return False
 
 
+
 def _normalize_location_component(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
 
 
 def _country_code_for_qualifier(qualifier: str) -> str | None:
@@ -4105,10 +4248,12 @@ def _country_code_for_qualifier(qualifier: str) -> str | None:
     return None
 
 
+
 def _requested_location_mismatch(
     destination: str,
     resolved: dict[str, Any] | None,
 ) -> tuple[str | None, bool]:
+    """Compare the requested place with what the provider resolved. Returns (warning, is_hard_mismatch)."""
     parts = [part.strip() for part in destination.split(",") if part.strip()]
     if not parts:
         return None, False
@@ -4182,14 +4327,17 @@ def _requested_location_mismatch(
     return None, False
 
 
+
 @lru_cache(maxsize=1)
 def _weather_timezone_finder() -> TimezoneFinder:
     return TimezoneFinder()
 
 
+
 def _timezone_from_weather_location(
     location: dict[str, Any] | None,
 ) -> tuple[ZoneInfo | None, str | None]:
+    """IANA timezone from coordinates; more reliable than a fixed UTC offset around DST changes."""
     if not location or "latitude" not in location or "longitude" not in location:
         return None, None
 
@@ -4206,11 +4354,13 @@ def _timezone_from_weather_location(
         return None, timezone_name
 
 
+
 def _resolve_weather_forecast_dates(
     travel_date: str,
     return_date: str,
     duration_text: str,
 ) -> tuple[str, str | None]:
+    """Validate dates and duration, infer the forecast end date. Returns (end_date, error_or_None)."""
     forecast_end = return_date
     start = None
     end = None
@@ -4278,6 +4428,7 @@ def _resolve_weather_forecast_dates(
     return forecast_end, None
 
 
+
 def _weather_condition_category(condition: str) -> str:
     normalized = condition.casefold()
     if "thunder" in normalized or "storm" in normalized:
@@ -4297,6 +4448,7 @@ def _weather_condition_category(condition: str) -> str:
     return condition.strip().capitalize()
 
 
+
 def _weather_temperature_text(value: Any) -> str | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -4308,14 +4460,17 @@ def _weather_temperature_text(value: Any) -> str | None:
     return f"{round(value)}°C"
 
 
+
 def _forecast_date(item: dict[str, Any]) -> date | None:
     value = item.get("destination_local_datetime") or item.get("datetime")
     parsed = _forecast_datetime(value)
     return parsed.date() if parsed else None
 
 
+
 def _format_weather_date(value: date) -> str:
     return f"{value.strftime('%b')} {value.day}"
+
 
 
 def _forecast_period_label(forecast: list[dict[str, Any]]) -> str | None:
@@ -4340,7 +4495,9 @@ def _forecast_period_label(forecast: list[dict[str, Any]]) -> str | None:
     return f"{_format_weather_date(start)}-{_format_weather_date(end)}"
 
 
+
 def _summarize_weather_forecast(forecast: list[dict[str, Any]]) -> str:
+    """One-line summary: temperature range, dominant condition and rain notes."""
     temperatures = []
     condition_counts: dict[str, int] = {}
     rain_dates = set()
@@ -4400,9 +4557,22 @@ def _summarize_weather_forecast(forecast: list[dict[str, Any]]) -> str:
     return "; ".join(summary_parts)
 
 
+
 def _capitalize_first(value: str) -> str:
     return value[:1].upper() + value[1:]
 
+
+
+# ===== Weather Agent =====
+
+# External API + MCP + Python validation
+# Function: weather_agent(state)
+# Data provider: OpenWeather
+# Integration: Weather MCP server through weather_mcp_search() and forecast_mcp_search().
+
+# The Weather Agent has two separate tasks:
+# 1. Fetch the current weather for the destination.
+# 2. Fetch the available forecast and determine whether it covers the user's travel dates.
 
 def weather_agent(state: TravelState):
     """Fetch weather, but only describe forecasts as relevant to dates they cover."""
@@ -4413,7 +4583,8 @@ def weather_agent(state: TravelState):
     travel_date = str(constraints.get("travel_date", "")).strip()
     return_date = str(constraints.get("return_date", "")).strip()
     duration_text = str(constraints.get("duration", "")).strip()
-
+    
+    # Step 1: Validate trip dates/duration
     forecast_end, forecast_date_matching_error = _resolve_weather_forecast_dates(
         travel_date,
         return_date,
@@ -4449,6 +4620,8 @@ def weather_agent(state: TravelState):
     if not city:
         weather_results = "Weather search requires a destination city."
     else:
+        # Step 2: Fetch current weather (right now) and the forecast (coming days)
+        # at the same time. They don't depend on each other, so they can run concurrently.
         async def fetch_weather():
             async def safe_current():
                 try:
@@ -4466,7 +4639,8 @@ def weather_agent(state: TravelState):
 
         try:
             current, forecast = run_async(fetch_weather())
-
+            
+            # Step 3: Check the provider(i.e, OpenWeather API) found the requested place (e.g. "Paris, TX" vs "Paris, FR")
             current_location = _provider_weather_location(current)
             forecast_location = _provider_weather_location(forecast)
             weather_data["current_location"] = current_location
@@ -4528,6 +4702,7 @@ def weather_agent(state: TravelState):
             elif isinstance(forecast, dict):
                 items = forecast.get("forecast", [])
                 if isinstance(items, list):
+                    # Step 4: Drop malformed entries and duplicate timestamps
                     entries_by_instant = {}
                     invalid_entries = 0
                     duplicates = 0
@@ -4582,7 +4757,8 @@ def weather_agent(state: TravelState):
                         )
                 else:
                     weather_data["forecast_error"] = "Invalid forecast response format."
-
+                    
+            # Step 5: Resolve the destination timezone (coordinates first, UTC offset as fallback)
             timezone_offset = (
                 forecast.get("timezone_offset_seconds")
                 if isinstance(forecast, dict)
@@ -4635,7 +4811,8 @@ def weather_agent(state: TravelState):
                     weather_data["timezone_offset_seconds"] = int(
                         offset.total_seconds()
                     )
-
+                    
+            # Step 6: Add destination-local time to each entry, then keep only the trip dates
             all_forecast = weather_data["forecast"]
             if destination_timezone is not None:
                 localized_forecast = []
@@ -4675,7 +4852,8 @@ def weather_agent(state: TravelState):
                         <= parsed.astimezone(destination_timezone).date()
                         <= end_date
                     ]
-
+                    
+            # Step 7: Build the text summary
             lines = [f"Weather Information for {city}", ""]
             if weather_data["location_resolution_warning"]:
                 lines.append(
@@ -4789,20 +4967,22 @@ def weather_agent(state: TravelState):
 
 
 
-# =========================
-# Budget Agent - Improved Version
-# =========================
-# (Deterministic Python — no LLM)
-
-# Function: budget_agent(state)
-# This agent uses deterministic arithmetic and source-researched prices when
-# an itinerary and usable travel-cost sources are available.
+# ============================================================
+# 4.4 BUDGET AGENT
+# Source: deterministic arithmetic; Tavily + LLM only to find stated prices
+# Reads:  trip_constraints, user_query, itinerary, hotel_data, flight_fare,
+#         revision_agents, human_feedback
+# Writes: budget_results, itinerary (rebuilt with section 6), llm_calls
+# Rule:   every sourced price is re-verified in code. Anything unverified
+#         uses a clearly labelled rough fallback.
+# ============================================================
 
 
 async def _search_trip_cost_sources(
     destination: str,
     itinerary: str,
 ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+    """Run food, transport and sightseeing price searches in parallel."""
     itinerary_context = itinerary[:1600]
     queries = {
         "food": (
@@ -4842,7 +5022,9 @@ async def _search_trip_cost_sources(
     return sources, errors
 
 
+
 def _cost_source_price_ranges(text: str, currency: str) -> set[tuple[float, float]]:
+    """Find (low, high) amounts for one currency; used to confirm an LLM-extracted price really appears in the source."""
     currency_markers = {
         "INR": r"(?:₹|\bINR\b|\bRs\.?)",
         "USD": r"(?:US\$|\bUSD\b|\$)",
@@ -4922,7 +5104,10 @@ def _cost_source_price_ranges(text: str, currency: str) -> set[tuple[float, floa
     return ranges
 
 
+
 def _is_official_attraction_source(source_url: str) -> bool:
+    """Attraction ticket prices are accepted only from government domains."""
+
     parsed_url = urlparse(str(source_url or "").strip())
     if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
         return False
@@ -4940,6 +5125,7 @@ def _is_official_attraction_source(source_url: str) -> bool:
 
 
 def _cost_evidence_has_unit(evidence: str, unit: str) -> bool:
+    """Check the evidence states the unit (per person/day, meal, ride or visit)."""
     text = " ".join(evidence.lower().split())
     if unit == "per_person_per_day":
         has_person = bool(re.search(
@@ -4976,7 +5162,9 @@ def _cost_evidence_has_unit(evidence: str, unit: str) -> bool:
     return False
 
 
+
 def _itinerary_visit_count(itinerary: str, attraction_name: str) -> int:
+    """Count how many Day rows mention an attraction (= number of paid visits)."""
     section = extract_canonical_sections(itinerary).get(5, itinerary)
     rows = [
         line for line in section.splitlines()
@@ -4993,10 +5181,16 @@ def _itinerary_visit_count(itinerary: str, attraction_name: str) -> int:
     )
 
 
+
 def _extract_researched_trip_costs(
     sources: dict[str, list[dict[str, Any]]],
     itinerary: str,
 ) -> dict[str, list[dict[str, Any]]]:
+    """
+    The LLM proposes prices; code then re-checks each one: URL belongs to the
+    results, evidence is verbatim, unit and currency are stated, and the
+    amounts appear in the evidence. Anything that fails is dropped.
+    """
     empty = {
         "food": [],
         "transport": [],
@@ -5215,10 +5409,12 @@ SEARCH RESULTS:
     return accepted
 
 
+
 def _resolve_trip_duration(
     constraints: dict[str, Any],
 ) -> tuple[int, int, str, bool]:
-    """Resolve trip length, preferring a valid outbound/return date span."""
+    """Return (days, nights, source, mismatch). Dates take priority over the stated duration."""
+    
     duration_text = str((constraints or {}).get("duration", "")).strip()
     travel_date = str((constraints or {}).get("travel_date", "")).strip()
     return_date = str((constraints or {}).get("return_date", "")).strip()
@@ -5259,6 +5455,14 @@ def _resolve_trip_duration(
     return days, nights, source, False
 
 
+
+# ===== Budget Agent =====
+
+# (Deterministic Python — no LLM)
+# Function: budget_agent(state)
+# This agent uses deterministic arithmetic and source-researched prices when
+# an itinerary and usable travel-cost sources are available.
+
 def budget_agent(state: TravelState):
     """
     Deterministic group-aware planning estimate.
@@ -5282,7 +5486,8 @@ def budget_agent(state: TravelState):
     duration_text = str(constraints.get("duration", "")).strip()
     travel_style = str(constraints.get("travel_style", "")).lower()
     hotel_budget = str(constraints.get("hotel_budget", "")).strip()
-
+    
+    # Step 1: Resolve trip length and party size
     days, nights, duration_source, duration_mismatch = _resolve_trip_duration(
         constraints
     )
@@ -5311,6 +5516,7 @@ def budget_agent(state: TravelState):
     }
     cost_research_failures = []
     cost_research_llm_calls = 0
+    # Step 2: Research prices from the itinerary (needs a finished itinerary)
     if itinerary and destination != "Not provided":
         cost_sources, cost_search_errors = run_async(
             _search_trip_cost_sources(destination, itinerary)
@@ -5333,6 +5539,8 @@ def budget_agent(state: TravelState):
 
     # One room is assumed for up to two travellers. Additional rooms are
     # added for larger groups; users should confirm actual occupancy rules.
+    
+    # Step 3: Accommodation. Assume 1 room per 2 travellers.
     rooms = max(1, math.ceil(travellers / 2))
 
     def source_links(records):
@@ -5386,7 +5594,8 @@ def budget_agent(state: TravelState):
                 f"{source_price}{conversion_note})"
             )
         return "; ".join(links)
-
+    
+    # Generic nightly fallback by travel style, used only when no hotel price was found.
     if any(term in travel_style for term in ("luxury", "premium")):
         hotel_low_nightly, hotel_high_nightly = 8000, 18000
     elif any(term in travel_style for term in ("budget", "cheap", "backpack")):
@@ -5518,7 +5727,8 @@ def budget_agent(state: TravelState):
         transport_daily_low, transport_daily_high = 800, 1500
         activities_per_person_low, activities_per_person_high = 1500, 4000
         transport_basis = "Comfortable mix of app-based cabs and autos; full-day private cab excluded"
-
+        
+    # Step 4: Food (sourced if possible, else fallback)
     food_records = researched_costs["food"]
     if food_records:
         meal_records = [
@@ -5553,7 +5763,8 @@ def budget_agent(state: TravelState):
         )
     food_per_person_low = round(food_daily_low * days)
     food_per_person_high = round(food_daily_high * days)
-
+    
+    # Step 5: Local transport
     transport_records = researched_costs["transport"]
     transport_ride_records = [
         record for record in transport_records
@@ -5604,7 +5815,7 @@ def budget_agent(state: TravelState):
             f"{transport_basis}; rough fallback, not a real-time price, "
             "no usable sourced daily rate"
         )
-
+        
     def aggregate_visit_prices(records):
         grouped = {}
         for record in records:
@@ -5626,7 +5837,8 @@ def budget_agent(state: TravelState):
                 )
                 grouped[key]["sources"].append(record)
         return list(grouped.values())
-
+    
+    # Step 6: Sightseeing tickets (official sources only)
     sightseeing_items = aggregate_visit_prices(researched_costs["sightseeing"])
     if sightseeing_items:
         sightseeing_per_person_low = round(sum(
@@ -5657,7 +5869,8 @@ def budget_agent(state: TravelState):
             "₹1,200–₹2,500/person for the trip; rough fallback, "
             "not a real-time ticket price; no usable official ticket prices found"
         )
-
+        
+    # Step 7: Activities
     activity_items = aggregate_visit_prices(researched_costs["activities"])
     if activity_items:
         activities_per_person_low = round(sum(
@@ -5686,7 +5899,8 @@ def budget_agent(state: TravelState):
             "for optional experiences; rough fallback, not a real-time price, "
             "no usable activity prices found"
         )
-
+        
+    # Step 8: Flat contingency for tips, water and small purchases.
     misc_per_person_low, misc_per_person_high = 500, 1000
 
     categories = [
@@ -5704,7 +5918,8 @@ def budget_agent(state: TravelState):
          "₹500–₹1,000/person; rough contingency fallback, not a real-time price, "
          "for tips, water and small purchases"),
     ]
-
+    
+    # Step 9: Airfare (included only when a route-matched INR fare exists)
     flight_fare = state.get("flight_fare", {}) or {}
     airfare_included = flight_fare.get("status") == "indicative"
     flight_source_records = []
@@ -5750,7 +5965,8 @@ def budget_agent(state: TravelState):
             flight_high,
             flight_basis,
         ))
-
+        
+    # Step 10: Totals and comparison with the user's overall budget
     group_low = sum(item[1] for item in categories)
     group_high = sum(item[2] for item in categories)
     per_person_low = round(group_low / travellers)
@@ -5847,7 +6063,8 @@ def budget_agent(state: TravelState):
             " One or more price searches/extractions failed; unavailable "
             "categories use clearly labelled rough fallbacks."
         )
-
+        
+    # Step 11: Build the text report
     lines = [
         "**TRIP ASSUMPTIONS**",
         "",
@@ -5938,6 +6155,7 @@ def budget_agent(state: TravelState):
     ])
 
     budget_results = "\n".join(lines)
+    # Step 12: Rebuild the itinerary so section 6 shows the fresh budget.
     finalized_itinerary = None
     if itinerary:
         constraints_data = state.get("trip_constraints", {}) or {}
@@ -5979,7 +6197,6 @@ def budget_agent(state: TravelState):
     if finalized_itinerary is not None:
         result["itinerary"] = finalized_itinerary
     return result
-
 
 
 
@@ -6071,8 +6288,19 @@ def add_booking_links_to_hotel_table(
 
 
 
+
+
+# ============================================================
+# 5. ITINERARY AGENT (+ day-table validation)
+# Source: Groq LLM, combined with verified agent data
+# Reads:  user_query, trip_constraints, flight_results, hotel_data,
+#         weather_results, flight_fare, flight_data, weather_data
+# Writes: itinerary (full 7-section draft), approval_request, llm_calls
+# ============================================================
+
+
 def expected_itinerary_day_count(constraints: dict[str, Any]) -> int | None:
-    """Return the shared effective trip length for itinerary validation."""
+    """Number of Day rows the itinerary must contain (from dates or duration); None if unknown."""
     date_days, _, duration_source, _ = _resolve_trip_duration(constraints or {})
     if duration_source == "dates":
         return date_days if 1 <= date_days <= 30 else None
@@ -6093,9 +6321,11 @@ def expected_itinerary_day_count(constraints: dict[str, Any]) -> int | None:
     return None
 
 
+
 def _normalize_itinerary_cell(value: str) -> str:
     value = re.sub(r"<br\s*/?>", "", str(value), flags=re.IGNORECASE)
     return re.sub(r"[*_`]", "", value).strip()
+
 
 
 def _itinerary_day_validation_error(
@@ -6103,6 +6333,11 @@ def _itinerary_day_validation_error(
     constraints: dict[str, Any],
     section_present: bool = True,
 ) -> str | None:
+    """
+    Check the Day table: 4-column header, separator row, exactly 4 non-empty
+    cells per row, Day 1..N once each and in order.
+    Returns a readable reason, or None when valid.
+    """
     expected = expected_itinerary_day_count(constraints)
     source = str(text or "").replace("\\n", "\n")
     table_lines = [line.strip() for line in source.splitlines() if line.strip()]
@@ -6243,31 +6478,37 @@ def _itinerary_day_validation_error(
 
 
 def itinerary_has_all_requested_days(text: str, constraints: dict[str, Any]) -> bool:
+    """Boolean wrapper around _itinerary_day_validation_error."""
     return _itinerary_day_validation_error(text, constraints) is None
 
 
 
-# =========================
-# Itinerary Agent
-# =========================
+
+# ===== Itinerary Agent =====
+
 # LLM-powered content generation + structured data integration
 #uses groq llm
-
 #IT INCLUDES THE COMPLETE PROMPT TO GENERATE THE PLAN
-
 # Function: itinerary_agent(state)
 # This is the main content-generation agent.
 # The earlier agents collect or calculate information. The Itinerary Agent takes their outputs and turns them into one complete travel plan.
 
 def itinerary_agent(state: TravelState):
-    """Create a concise, complete draft and retry if Groq truncates it."""
+    """
+    Main LLM content agent: writes the 7-section plan from flight, hotel and
+    weather data. Safeguards:
+      * retries once if the reply is empty or truncated by groq
+      * regenerates only the Day-by-Day table if days are missing
+      * rebuilds sections 2/3/4 from verified data, so the LLM can't alter them
+    """
 
     def compact_text(value, max_chars):
         text = str(value or "")
         if len(text) > max_chars:
             return text[:max_chars] + "\n[Additional details omitted.]"
         return text
-
+    
+    # Step 1: Shrink inputs and work out the exact trip length
     user_query = compact_text(state.get("user_query", ""), 1200)
     trip_constraints = state.get("trip_constraints", {}) or {}
     itinerary_constraints = dict(trip_constraints)
@@ -6299,6 +6540,7 @@ def itinerary_agent(state: TravelState):
 
     # Pass only useful hotel fields. Raw search snippets and full price
     # contexts were repeating large blocks of text in the itinerary prompt.
+    # Send only useful hotel fields; raw snippets bloated the prompt.
     hotel_fields = (
         "hotel_name",
         "category",
@@ -6354,7 +6596,8 @@ def itinerary_agent(state: TravelState):
             "not internal reasoning. Be practical, concise and complete."
         )
     )
-
+    
+    # Step 2: Build the prompt. Its ACCURACY rules exist to stop the model inventing prices, weather, distances or availability.
     prompt = f"""
 Create a complete, practical travel-plan draft for human review.
 
@@ -6479,6 +6722,7 @@ availability must be checked before booking.
 """
 
     messages = [system_message, HumanMessage(content=prompt)]
+    # Step 3: Generate the draft; retry once if truncated (finish_reason="length") or empty
     response = llm.invoke(messages)
     log_llm_usage("ITINERARY AGENT", response)
 
@@ -6541,6 +6785,8 @@ will be calculated from this completed itinerary.
 
     # Keep a recovered day-wise section separately. Appending it to the raw
     # model response can place it after section 7 and break section extraction.
+    
+    # Step 4: If the day table is missing or incomplete, regenerate just that section. Never show a partial itinerary as complete.
     recovered_day_plan = ""
     draft_sections = extract_canonical_sections(response_text)
     draft_day_section = draft_sections.get(5, "")
@@ -6628,6 +6874,8 @@ Do not invent exact clock times. Start directly with the table header.
         state.get("hotel_data", []),
         str(constraints_data.get("destination", "")),
     )
+    
+    # Step 5: Rebuild the final document (sections 2/3/4 from verified data)
     response_text = build_canonical_final_response(
         llm_output=response_text,
         draft=response_text,
@@ -6661,22 +6909,27 @@ Do not invent exact clock times. Start directly with the table header.
     }
 
 
-# =========================
-# Human-in-the-Loop approval
-# =========================
-# Human-in-the-loop (HITL)
+
+# ============================================================
+# 6. HUMAN APPROVAL, REVISION, FINAL
+# Reads:  itinerary, human_feedback, all agent data
+# Writes: approved, human_feedback, revision_*, final_response
+# ============================================================
+
+
+# ===== Human-in-the-Loop (HITL) approval =====
 
 # Function: human_approval_agent(state)
 # This is where your application gives the user control over the generated itinerary.
 # Instead of immediately returning the generated plan as final, LangGraph pauses and waits for the user's decision.
 
-# This is a conditional routing function.
-# - Approved → Final Agent.
-# - Not approved → Revision Agent, then final delivery without another review.
-
 def human_approval_agent(state: TravelState):
-    # LangGraph pauses here. A rejection is routed to revision_agent and then
-    # returned to this node for another review; it is never finalized directly.
+    """
+    Pause the graph (LangGraph interrupt) until /api/travel/approve is called.
+    approved=True  -> final_agent
+    approved=False -> revision_agent -> revision_finalize (delivered as final;
+                      there is no second approval round)
+    """
     review = interrupt(
         {
             "question": "Do you approve this itinerary?",
@@ -6711,28 +6964,39 @@ def human_approval_agent(state: TravelState):
     }
 
 
+
 def route_after_human_review(state: TravelState) -> str:
-    """Only an explicit approval may enter finalization."""
+    """
+    Conditional router that runs right after the approval step.
+
+    approved=True  -> final_agent
+    approved=False -> revision_agent, then revision_finalize
+                      (delivered as final, with no second approval)
+
+    Only an explicit approval may reach finalization; anything else goes to revision.
+    """
     return "final_agent" if state.get("approved", False) else "revision_agent"
 
 
 
-# =========================
-# Revision Agent
-# =========================
-# (LLM-powered editing agent)
+# ===== Revision Agent =====
 
+# (LLM-powered editing agent)
 # Function: revision_agent(state)
 # This agent is responsible for modifying the existing travel plan according to user feedback.
 # An important point: it does not start the entire travel-planning workflow again.
-
 
 def plan_revision_research(
     feedback: str,
     current_constraints: dict[str, Any],
     selected_agents: list[str],
 ) -> tuple[dict[str, Any], list[str], str, str]:
-    """Identify specialist searches affected by feedback and apply explicit constraint changes."""
+    """
+    The LLM decides which specialist agents the feedback affects and which
+    constraints changed. Its output is validated before use.
+    Returns (updated_constraints, agents_to_rerun, flight_time_pref, airline_pref).
+    """
+    
     prompt = f"""
 Classify the user's travel-plan revision request for specialist re-search.
 
@@ -6848,6 +7112,10 @@ USER FEEDBACK:
     targets = set(plan.agents_to_rerun)
     if plan.flight_departure_preference or flight_airline_preference:
         targets.add("flight_agent")
+        
+    # Which specialists must re-run when a constraint changes. A new destination
+    # invalidates flights, hotels and weather; a new overall budget only needs
+    # the budget agent; a hotel budget needs hotels (new search) and budget.
     affected_agents = {
         "origin": {"flight_agent"},
         "destination": {"flight_agent", "hotel_agent", "weather_agent"},
@@ -6876,7 +7144,10 @@ USER FEEDBACK:
 
 
 def revision_agent(state: TravelState):
-    """Revise the draft and schedule fresh research for affected specialists."""
+    """
+    Edit the EXISTING draft (sections 1, 5 and 7 only) per the user's feedback
+    and schedule re-runs of the affected agents. It does not rebuild the whole plan.
+    """
     original_draft = str(state.get("itinerary", "") or "").strip()
     feedback = str(state.get("human_feedback", "") or "").strip()
     revision_count = int(state.get("revision_count", 0) or 0) + 1
@@ -6885,7 +7156,8 @@ def revision_agent(state: TravelState):
             "Improve the existing plan while preserving its destination, duration, "
             "travel assumptions, and all factual agent results. Do not invent details."
         )
-
+        
+    # Step 1: Work out which agents must re-run and what constraints changed
     (
         constraints_data,
         revision_agents,
@@ -6897,7 +7169,8 @@ def revision_agent(state: TravelState):
         _selected_agents(state),
     )
     research_plan_llm_calls = 1
-
+    
+    # Step 2: Edit prompt. Only sections 1/5/7 are rewritten; 2/3/4/6 are rebuilt from data.
     prompt = f"""
 Revise the EXISTING travel-plan draft using the user's feedback.
 
@@ -7004,14 +7277,16 @@ RULES:
                 flush=True,
             )
         return sections, day_plan, validation_error
-
+    
+    # Step 3: Generate the revision and validate its day table
     revised = request_revision(prompt, "REVISION FIRST ATTEMPT")
     revision_llm_calls = 1
     revised_sections, day_plan, validation_error = inspect_revision_response(
         revised,
         "REVISION FIRST ATTEMPT",
     )
-
+    
+    # Step 4: Retry once, passing the exact validation error back to the model
     if validation_error is not None:
         expected_day_instruction = (
             f"exactly {expected_days} days (Day 1 through Day {expected_days})"
@@ -7056,7 +7331,8 @@ PREVIOUS RESPONSE THAT FAILED VALIDATION:
                 f"itinerary after one retry. Validation failure: {validation_error} "
                 "The previous draft remains saved; please retry the requested changes."
             )
-
+            
+    # Step 5: Rebuild the full document with verified data
     verified_hotels = sanitize_verified_hotel_data(
         state.get("hotel_data", []),
         str(constraints_data.get("destination", "")),
@@ -7105,8 +7381,9 @@ PREVIOUS RESPONSE THAT FAILED VALIDATION:
     }
 
 
+
 def revision_finalize_agent(state: TravelState):
-    """Rebuild and deliver the revised draft without requesting another review."""
+    """Rebuild the revised draft with fresh agent data and deliver it as final (no second approval)."""
     constraints = state.get("trip_constraints", {}) or {}
     draft = str(state.get("itinerary", "") or "")
     verified_hotels = sanitize_verified_hotel_data(
@@ -7147,10 +7424,62 @@ def revision_finalize_agent(state: TravelState):
     }
 
 
+
+# ===== Final Response Agent =====
+
+# (Approval and finalization)
+# Function: final_agent(state)
+# This is the last agent in your workflow.
+# And its job is surprisingly simple.
+# It does not generate a new itinerary.
+# It does not call Groq.
+# It does not search for hotels or flights.
+# It simply finalizes the exact draft that the user approved.
+# The final response is the same canonical draft shown during approval, not a newly generated answer.
+
+def final_agent(state: TravelState):
+    """
+    Approval is a confirmation, not a regeneration: returns the exact draft the
+    user reviewed. No LLM call, no rewriting.
+    """
+    if not state.get("approved", False):
+        raise ValueError(
+            "Finalization was requested without explicit user approval. "
+            "The draft must return to the review step."
+        )
+
+    draft = str(state.get("itinerary", "") or "")
+    if not draft.strip():
+        raise ValueError(
+            "The approved draft is empty. Refusing to generate a different plan."
+        )
+
+    print(
+        "FINAL RESPONSE POST-PROCESSING: approval-only; returning the exact "
+        "reviewed draft unchanged (no section rebuilding or content rewriting).",
+        flush=True,
+    )
+
+    return {
+        "final_response": draft,
+        "messages": [AIMessage(content=draft)],
+        "llm_calls": state.get("llm_calls", 0),
+    }
+
+
+
+
+# ============================================================
+# 7. RENDERERS: build the final 7-section markdown response
+# Everything here is deterministic: it formats verified data and never
+# calls the LLM.
+# ============================================================
+
+
 def sanitize_verified_hotel_data(
     hotels: Any, destination: str = ""
 ) -> list[dict[str, Any]]:
-    """Final safety gate: retain only properties independently tied to destination."""
+    """Last safety gate: keep only hotels with a verified property page, a valid URL and a unique name."""
     if not isinstance(hotels, list):
         return []
     accepted = []
@@ -7190,7 +7519,6 @@ def sanitize_verified_hotel_data(
 
 
 
-
 def remove_generic_hotel_listing_lines(hotel_section_body: str) -> str:
     """Remove obvious directory/listicle rows without touching named properties."""
     bad_line = re.compile(
@@ -7204,6 +7532,7 @@ def remove_generic_hotel_listing_lines(hotel_section_body: str) -> str:
         if not bad_line.search(line)
     ]
     return "\n".join(kept).strip()
+
 
 
 def append_verified_hotel_links_to_draft(
@@ -7240,7 +7569,9 @@ def append_verified_hotel_links_to_draft(
     return body
 
 
+
 def format_hotel_price_display(hotel: dict[str, Any]) -> tuple[str, str]:
+    """Return (price_text, remarks). Handles nightly, derived-from-total, unknown period and no-conversion cases."""
     currency = str(hotel.get("currency") or "—")
     price = hotel.get("price_per_night")
     original_price = hotel.get("original_price_per_night")
@@ -7316,8 +7647,9 @@ def format_hotel_price_display(hotel: dict[str, Any]) -> tuple[str, str]:
     )
 
 
+
 def render_hotel_section(hotels: list[dict[str, Any]]) -> str:
-    """Render only individually verified hotels in a consistent markdown table."""
+    """Section 3 as a markdown table; shows an explicit notice when no hotel was verified."""
     if not hotels:
         return (
             "## 3. Hotel Suggestions\n\n"
@@ -7368,13 +7700,14 @@ def render_hotel_section(hotels: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+
 def render_flight_section(
     flight_data: Any,
     flight_results: str,
     constraints: dict,
     flight_fare: dict[str, Any] | None = None,
 ) -> str:
-    """Render verified schedules as clean, sortable tables."""
+    """Section 2: outbound/return tables from schedules, a Google Flights link when schedules are unavailable, plus the fare note."""
     from urllib.parse import quote_plus
     from datetime import datetime, timezone
 
@@ -7601,11 +7934,10 @@ SECTION_TITLES = {
     7: "Final Recommendations",
 }
 
+
+
 def extract_canonical_sections(document: str) -> dict[int, str]:
-    """
-    Extract the seven known top-level sections. Supports numbered headings,
-    Markdown bold/heading variants, and unnumbered exact section titles.
-    """
+    """Split a document into sections 1-7 by heading; tolerates #, **bold**, numbered or plain titles."""
     if not document:
         return {}
 
@@ -7635,8 +7967,9 @@ def extract_canonical_sections(document: str) -> dict[int, str]:
     return sections
 
 
+
 def clean_preserved_section_body(body: str, remove_embedded_duplicates: bool = False) -> str:
-    """Remove stray separators and duplicate deterministic blocks from LLM prose."""
+    """Strip stray '---' separators and duplicate deterministic blocks from LLM prose."""
     text = str(body or "").strip()
     if not text:
         return ""
@@ -7656,11 +7989,16 @@ def clean_preserved_section_body(body: str, remove_embedded_duplicates: bool = F
     return text.strip()
 
 
+
 def format_day_by_day_itinerary(
     body: str,
     expected_days: int | None = None,
 ) -> str:
-    """Preserve only a structurally complete four-column day table."""
+    """
+    A valid 4-column day table is kept as is. Labelled "Day N" blocks are
+    converted into a table. An incomplete table returns a failure notice
+    instead of fabricating missing days.
+    """
     text = str(body or "").replace("\\n", "\n").strip()
     if not text:
         return text
@@ -7835,6 +8173,7 @@ def format_day_by_day_itinerary(
     return "\n".join(rows)
 
 
+
 def format_as_bullets(body: str) -> str:
     """Turn plain recommendation lines into a clean Markdown list."""
     lines = []
@@ -7850,6 +8189,7 @@ def format_as_bullets(body: str) -> str:
     return "\n".join(lines).strip()
 
 
+
 def build_canonical_final_response(
     llm_output: str,
     draft: str,
@@ -7861,13 +8201,38 @@ def build_canonical_final_response(
     itinerary_override: str | None = None,
 ) -> str:
     """
-    Build exactly seven top-level sections. Sections 2/3/4/6 always come from
-    deterministic agent data; only 1/5/7 are retained from the Final Agent.
-    This prevents duplicate or appended deterministic sections regardless of
-    Markdown formatting produced by the LLM.
+    Assemble exactly seven top-level sections.
+
+    LLM text is kept ONLY for sections 1, 5 and 7 (summary, day table, tips).
+    Sections 2, 3, 4 and 6 are always rebuilt from agent data, so they can
+    never be duplicated or altered by the model.
+
+    Where this function is called from:
+
+        itinerary_agent ----> build_canonical_final_response()  (draft is created)
+                |
+                v
+        budget_agent -------> build_canonical_final_response()  (budget added to section 6)
+                |
+                v
+        human_approval
+           |-- approved ----> final_agent  (returns the draft unchanged; does NOT call this)
+           |-- rejected ----> revision_agent --> build_canonical_final_response()
+                                    |
+                              (affected agents re-run)
+                                    |
+                                    v
+                              revision_finalize_agent --> build_canonical_final_response()
+
+    Note: budget_agent runs only if the supervisor selected it. Without it,
+    section 6 is omitted and "Final Recommendations" becomes section 6.
     """
     generated = extract_canonical_sections(llm_output)
     drafted = extract_canonical_sections(draft)
+    
+    # Sections 1, 5, 7 -> text written by the LLM (summary, day table, tips).
+    # Sections 2, 3, 4, 6 -> built from agent data below, so the model never
+    # controls prices, links or weather.
 
     summary = clean_preserved_section_body(
         generated.get(1) or drafted.get(1) or ""
@@ -7910,7 +8275,10 @@ def build_canonical_final_response(
     # When budget_agent did not run, budget_section is empty and we must NOT
     # show section 6. But section 7 must be renumbered to 6 so the output
     # does not visibly jump from "5." to "7.".
-    show_budget = bool(budget_section.strip())
+    show_budget = bool(budget_section.strip()) 
+    
+    # Without a budget section the document must not jump from "5." to "7.",
+    # so "Final Recommendations" is renumbered to 6.
     final_rec_number = 7 if show_budget else 6
 
     sections = [
@@ -7943,8 +8311,9 @@ def build_canonical_final_response(
 
 
 
+
 def render_weather_section(weather_data: Any, constraints: dict[str, Any]) -> str:
-    """Render only weather observations/forecast entries actually returned by MCP."""
+    """Section 4: only observations and forecast entries that the provider actually returned."""
     data = weather_data if isinstance(weather_data, dict) else {}
     city = str(data.get("city") or constraints.get("destination") or "destination")
     current = data.get("current_weather")
@@ -8039,12 +8408,9 @@ def render_weather_section(weather_data: Any, constraints: dict[str, Any]) -> st
     return "\n".join(lines)
 
 
+
 def render_budget_section(budget_results: str) -> str:
-    """
-    Present the deterministic budget in a user-facing hierarchy:
-    headline total, compact assumptions, readable cost table, then notes.
-    All monetary values and categories remain sourced from Budget Agent output.
-    """
+    """Section 6: headline total first, then assumptions, cost table, risks and tips."""
     body = str(budget_results or "").strip()
     if not body:
         body = "A deterministic budget estimate was not available."
@@ -8147,58 +8513,16 @@ def render_budget_section(budget_results: str) -> str:
         content = prefix + "\n\n" + content
     return "## 6. Estimated Budget\n\n" + content
 
-# =========================
-# Final Response Agent - original format kept, HITL feedback added
-# =========================
-# (Approval and finalization)
-
-# Function: final_agent(state)
-# This is the last agent in your workflow.
-# And its job is surprisingly simple.
-# It does not generate a new itinerary.
-# It does not call Groq.
-# It does not search for hotels or flights.
-# It simply finalizes the exact draft that the user approved.
-
-# The final response is the same canonical draft shown during approval, not a newly generated answer.
-
-def final_agent(state: TravelState):
-    """
-    Finalize exactly the draft that was last shown to the user.
-
-    Approval is a confirmation action, not a regeneration or formatting pass.
-    All enrichment (including hotel booking links) must already be present
-    before the draft is shown for review.
-    """
-    if not state.get("approved", False):
-        raise ValueError(
-            "Finalization was requested without explicit user approval. "
-            "The draft must return to the review step."
-        )
-
-    draft = str(state.get("itinerary", "") or "")
-    if not draft.strip():
-        raise ValueError(
-            "The approved draft is empty. Refusing to generate a different plan."
-        )
-
-    print(
-        "FINAL RESPONSE POST-PROCESSING: approval-only; returning the exact "
-        "reviewed draft unchanged (no section rebuilding or content rewriting).",
-        flush=True,
-    )
-
-    return {
-        "final_response": draft,
-        "messages": [AIMessage(content=draft)],
-        "llm_calls": state.get("llm_calls", 0),
-    }
 
 
 
-# =========================
-# Dynamic Supervisor Routing
-# =========================
+# ============================================================
+# 8. GRAPH WIRING + POSTGRESQL CHECKPOINTER
+# ============================================================
+
+
+# ===== Dynamic Supervisor Routing =====
+# node name for each router return value
 ROUTE_MAP = {
     "guardrail_blocked": "guardrail_blocked",
     "flight_agent": "flight_agent",
@@ -8211,12 +8535,16 @@ ROUTE_MAP = {
 }
 
 
+
 def _selected_agents(state: TravelState) -> list[str]:
+    """Selected agents in AGENT_ORDER."""
     selected = state.get("selected_agents", [])
     return [agent for agent in AGENT_ORDER if agent in selected]
 
 
+
 def route_from_supervisor(state: TravelState) -> str:
+    """Blocked -> guardrail_blocked; otherwise the first selected agent."""
     if not state.get("guardrail_allowed", True):
         return "guardrail_blocked"
 
@@ -8224,7 +8552,14 @@ def route_from_supervisor(state: TravelState) -> str:
     return selected[0] if selected else "itinerary_agent"
 
 
+
 def route_after_agent(current_agent: str):
+    """
+    Return a router for the node after current_agent.
+    Revision mode: follow state['revision_agents'], then revision_finalize.
+    Normal mode:   next selected agent in AGENT_ORDER; after itinerary or
+                   budget, go to human_approval.
+    """
     def route(state: TravelState) -> str:
         revision_agents = state.get("revision_agents", [])
         if current_agent in revision_agents:
@@ -8247,16 +8582,18 @@ def route_after_agent(current_agent: str):
     return route
 
 
+
 def route_after_revision(state: TravelState) -> str:
+    """First agent to re-run, or revision_finalize when nothing needs re-running."""
     revision_agents = state.get("revision_agents", [])
     if revision_agents:
         return revision_agents[0]
     return "revision_finalize"
 
 
-# =========================
-# Build Graph
-# =========================
+
+# ===== Build Graph =====
+# Build order: nodes -> entry edge -> conditional edges (dynamic routing) -> terminal edges.
 graph = StateGraph(TravelState)
 
 graph.add_node("supervisor", supervisor_agent)
@@ -8313,9 +8650,11 @@ graph.add_edge("revision_finalize", END)
 graph.add_edge("final_agent", END)
 graph.add_edge("guardrail_blocked", END)
 
-# =========================
-# PostgreSQL Checkpointer - original persistence kept
-# =========================
+
+
+# ===== PostgreSQL Checkpointer =====
+# State is checkpointed in PostgreSQL after every node, so a plan paused at
+# human approval can be resumed later with its thread_id.
 DATABASE_URL = get_database_url()
 _conn = psycopg.connect(
     DATABASE_URL,
@@ -8328,10 +8667,15 @@ checkpointer.setup()
 travel_graph = graph.compile(checkpointer=checkpointer)
 
 
-# =========================
-# FastAPI-facing helpers
-# =========================
+
+
+# ============================================================
+# 9. FASTAPI-FACING HELPERS
+# ============================================================
+
+
 def _interrupt_payload(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the payload of the pending interrupt, or None if the run finished."""
     interrupts = result.get("__interrupt__", [])
     if not interrupts:
         return None
@@ -8341,10 +8685,12 @@ def _interrupt_payload(result: dict[str, Any]) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else {"value": payload}
 
 
+
 def _serialize_result(
     result: dict[str, Any],
     thread_id: str,
 ) -> dict[str, Any]:
+    """Convert graph output to the JSON the UI expects. While paused for approval, 'answer' is the draft itinerary."""
     messages = result.get("messages", [])
     last_message = messages[-1].content if messages else ""
     answer = result.get("final_response") or last_message
@@ -8390,8 +8736,9 @@ def _serialize_result(
     }
 
 
+
 def run_travel_agent(user_input: str, thread_id: str | None = None):
-    """Start a new travel-planning run and pause at human approval."""
+    """Start a new plan (creates a thread_id if none) and run until the approval pause."""
     if not thread_id:
         thread_id = f"user_{uuid.uuid4().hex}"
 
@@ -8432,12 +8779,16 @@ def run_travel_agent(user_input: str, thread_id: str | None = None):
     return _serialize_result(result, thread_id)
 
 
+
 def resume_travel_agent(
     thread_id: str,
     approved: bool,
     feedback: str = "",
 ):
-    """Resume the paused LangGraph thread after human review."""
+    """
+    Resume the paused LangGraph thread after human review.
+    Resume a paused thread with the user's approve / reject decision.
+    """
     if not thread_id:
         raise ValueError("thread_id is required to resume a travel plan.")
 
